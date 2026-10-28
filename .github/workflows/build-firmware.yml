@@ -1,0 +1,243 @@
+name: Build SIBOAT Firmware (Main ESP32 + ESP32-CAM)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "firmware/**"
+      - "siboat_inferencing.zip"
+      - ".github/workflows/build-firmware.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: siboat-firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARDUINO_CLI_VERSION: "1.5.1"
+  ESP32_CORE_VERSION: "3.3.5"
+  ESP32_INDEX_URL: "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+  REPO_IS_PRIVATE: ${{ github.event.repository.private }}
+
+jobs:
+  build:
+    name: Compile ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "Main ESP32"
+            short: main
+            sketch: SIBOAT_MAIN-ESP32_FIRMWARE_FINAL_BOSS
+            fqbn: "esp32:esp32:esp32"
+            needs_ei: "false"
+          - label: "ESP32-CAM"
+            short: cam
+            sketch: SIBOAT_ESP32-CAM_FIRMWARE_FINAL_BOSS
+            fqbn: "esp32:esp32:esp32cam"
+            needs_ei: "true"
+
+    env:
+      SHORT: ${{ matrix.short }}
+      SKETCH: ${{ matrix.sketch }}
+      FQBN_BASE: ${{ matrix.fqbn }}
+      NEEDS_EI: ${{ matrix.needs_ei }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+        with:
+          version: ${{ env.ARDUINO_CLI_VERSION }}
+
+      - name: Install ESP32 Arduino core
+        run: |
+          set -euo pipefail
+          arduino-cli version
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli core list
+
+      - name: Check firmware source files
+        run: |
+          set -euo pipefail
+          DIR="firmware/${SHORT}/${SKETCH}"
+          SRC="${DIR}/${SKETCH}.ino"
+          if [ ! -s "$SRC" ]; then
+            echo "::error::Missing ${SRC}. Folder and file names are case sensitive and must match exactly."
+            find . -name '*.ino' -not -path './.git/*' -print || true
+            exit 1
+          fi
+          test -s "${DIR}/siboat_secrets.example.h" || { echo "::error::Missing ${DIR}/siboat_secrets.example.h"; exit 1; }
+          if [ "$SHORT" = "main" ]; then
+            test -s "${DIR}/siboat_main_types.h" || { echo "::error::Missing ${DIR}/siboat_main_types.h"; exit 1; }
+          fi
+          grep -q 'ArduinoOTA.begin'  "$SRC" || { echo "::error::ArduinoOTA.begin() is missing from ${SRC}. The OTA lines must stay in the firmware."; exit 1; }
+          grep -q 'ArduinoOTA.handle' "$SRC" || { echo "::error::ArduinoOTA.handle() is missing from ${SRC}. The OTA lines must stay in the firmware."; exit 1; }
+          VER="$(grep -E '^#define (CAM_)?FW_VERSION ' "$SRC" | head -1 | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
+          echo "FW_VERSION=${VER:-unknown}" >> "$GITHUB_ENV"
+          echo "Source OK: $SRC (firmware version ${VER:-unknown})"
+
+      - name: Prepare Wi-Fi and Bluetooth secrets header
+        env:
+          SIBOAT_SECRETS_H: ${{ secrets.SIBOAT_SECRETS_H }}
+        run: |
+          set -euo pipefail
+          DIR="firmware/${SHORT}/${SKETCH}"
+          mkdir -p build
+          if [ -n "${SIBOAT_SECRETS_H:-}" ] && [ "${REPO_IS_PRIVATE}" = "true" ]; then
+            printf '%s\n' "$SIBOAT_SECRETS_H" > "${DIR}/siboat_secrets.h"
+            MODE="REAL credentials from secret SIBOAT_SECRETS_H"
+          else
+            cp "${DIR}/siboat_secrets.example.h" "${DIR}/siboat_secrets.h"
+            if [ -n "${SIBOAT_SECRETS_H:-}" ]; then
+              MODE="PLACEHOLDER (repository is public, so the secret was NOT embedded on purpose)"
+            else
+              MODE="PLACEHOLDER (secret SIBOAT_SECRETS_H is not set)"
+            fi
+            echo "::warning::${MODE}. This build compiles, but it will not join your Wi-Fi."
+          fi
+          echo "$MODE" > build/credentials_mode.txt
+          echo "Credentials mode: $MODE"
+
+      - name: Install Edge Impulse library (ESP32-CAM only)
+        if: matrix.needs_ei == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -s siboat_inferencing.zip ]; then
+            echo "::error::siboat_inferencing.zip is missing from the repository root. Upload the Edge Impulse Arduino library ZIP there, with exactly this lowercase name."
+            exit 1
+          fi
+          EI_TMP="${RUNNER_TEMP}/siboat-ei"
+          EI_LIBS="${RUNNER_TEMP}/siboat-libraries"
+          rm -rf "$EI_TMP" "$EI_LIBS"
+          mkdir -p "$EI_TMP" "$EI_LIBS"
+          unzip -q siboat_inferencing.zip -d "$EI_TMP"
+          PROP="$(find "$EI_TMP" -name library.properties -print -quit)"
+          if [ -z "$PROP" ]; then
+            echo "::error::library.properties was not found inside siboat_inferencing.zip. Export the Arduino library again from Edge Impulse (Deployment > Arduino library)."
+            exit 1
+          fi
+          LIB_ROOT="$(dirname "$PROP")"
+          HDR="$(find "$LIB_ROOT" -name siboat_inferencing.h -print -quit)"
+          if [ -z "$HDR" ]; then
+            echo "::error::siboat_inferencing.h was not found inside the ZIP. The header must be named siboat_inferencing.h."
+            exit 1
+          fi
+          mkdir -p "$EI_LIBS/siboat_inferencing"
+          cp -a "$LIB_ROOT"/. "$EI_LIBS/siboat_inferencing/"
+          echo "EI_LIBS=${EI_LIBS}" >> "$GITHUB_ENV"
+          echo "Edge Impulse library ready: $HDR"
+
+      - name: Compile (OTA-capable partition first, fallback second)
+        run: |
+          set -uo pipefail
+          DIR="firmware/${SHORT}/${SKETCH}"
+          LIBFLAG=()
+          if [ "${NEEDS_EI}" = "true" ]; then LIBFLAG=(--libraries "${EI_LIBS}"); fi
+          mkdir -p build
+          USED=""
+          for PART in min_spiffs huge_app; do
+            rm -rf build/bin
+            mkdir -p build/bin
+            echo "=== Compiling ${SKETCH} with PartitionScheme=${PART} ==="
+            if arduino-cli compile \
+                 --fqbn "${FQBN_BASE}:PartitionScheme=${PART}" \
+                 "${LIBFLAG[@]}" \
+                 --export-binaries \
+                 --output-dir build/bin \
+                 "${DIR}" 2>&1 | tee "build/compile_${PART}.log"; then
+              USED="$PART"
+              break
+            fi
+            echo "::warning::PartitionScheme=${PART} failed (the sketch may not fit). Trying the next scheme."
+          done
+          if [ -z "$USED" ]; then
+            echo "::error::Compilation failed with every partition scheme. The first red error line in the log above is the cause."
+            exit 1
+          fi
+          echo "PART_USED=${USED}" >> "$GITHUB_ENV"
+
+      - name: Package firmware files and build report
+        run: |
+          set -euo pipefail
+          BIN="build/bin"
+          OUT="out/${SKETCH}"
+          mkdir -p "$OUT"
+
+          for f in "${SKETCH}.ino.bin" "${SKETCH}.ino.bootloader.bin" "${SKETCH}.ino.partitions.bin"; do
+            test -s "${BIN}/${f}" || { echo "::error::Expected compiler output ${f} was not produced."; ls -la "$BIN"; exit 1; }
+          done
+
+          cp "${BIN}/${SKETCH}.ino.bin"            "${OUT}/${SKETCH}.bin"
+          cp "${BIN}/${SKETCH}.ino.bootloader.bin" "${OUT}/${SKETCH}.bootloader.bin"
+          cp "${BIN}/${SKETCH}.ino.partitions.bin" "${OUT}/${SKETCH}.partitions.bin"
+
+          ALL="none"
+          if [ -s "${BIN}/${SKETCH}.ino.merged.bin" ]; then
+            ALL="${SKETCH}_ALL-IN-ONE_flash_at_0x0.bin"
+            cp "${BIN}/${SKETCH}.ino.merged.bin" "${OUT}/${ALL}"
+          fi
+
+          if [ "$PART_USED" = "min_spiffs" ]; then
+            OTA="YES - Wi-Fi (OTA) updates work after the first USB flash"
+          else
+            OTA="NO - huge_app has no second app slot, so every update must be done over USB"
+          fi
+          if [ "$SHORT" = "main" ]; then HOST="siboat.local"; else HOST="siboat-cam.local"; fi
+
+          {
+            echo "SIBOAT firmware build report"
+            echo "sketch:            ${SKETCH}"
+            echo "firmware version:  ${FW_VERSION}"
+            echo "board (FQBN):      ${FQBN_BASE}"
+            echo "partition scheme:  ${PART_USED}"
+            echo "OTA available:     ${OTA}"
+            echo "credentials:       $(cat build/credentials_mode.txt)"
+            echo "arduino-cli:       ${ARDUINO_CLI_VERSION}"
+            echo "ESP32 core:        ${ESP32_CORE_VERSION}"
+            echo "git commit:        ${GITHUB_SHA}"
+            echo "built (UTC):       $(date -u '+%Y-%m-%d %H:%M:%S')"
+            grep -hE 'Sketch uses|Global variables' "build/compile_${PART_USED}.log" || true
+            echo
+            echo "FILES"
+            echo "  ${SKETCH}.bin  = the application image (use this for Wi-Fi OTA updates)"
+            if [ "$ALL" = "none" ]; then
+              echo "  (no all-in-one image was produced by this core version)"
+            else
+              echo "  ${ALL}  = complete image for the FIRST flash over USB, written at address 0x0"
+            fi
+            echo "  *.bootloader.bin / *.partitions.bin = parts of the complete image (normally not needed)"
+            echo
+            echo "FLASHING"
+            if [ "$ALL" = "none" ]; then
+              echo "  1) First time over USB: write bootloader at 0x1000, partitions at 0x8000, boot_app0 at 0xE000 (from the ESP32 core), app at 0x10000."
+            else
+              echo "  1) First time over USB: write ${ALL} at address 0x0."
+            fi
+            echo "  2) Later updates over Wi-Fi (only if OTA available = YES): send ${SKETCH}.bin"
+            echo "     to ${HOST} (or the board IP), port 3232."
+            echo "  Always use the files from the same build."
+          } | tee "${OUT}/BUILD_REPORT.txt"
+
+          cat "${OUT}/BUILD_REPORT.txt" >> "$GITHUB_STEP_SUMMARY"
+          ( cd "$OUT" && sha256sum *.bin > SHA256SUMS.txt )
+          ls -la "$OUT"
+
+      - name: Upload firmware files
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.sketch }}
+          path: out/${{ matrix.sketch }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
