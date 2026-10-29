@@ -10,7 +10,7 @@
 
 // Bluetooth control PIN, 4 to 8 digits. While this is not a number, Bluetooth control stays OFF
 // (the Main ESP32 does not even advertise). Choose your own PIN; do not reuse a Wi-Fi password.
-#define SIBOAT_BLE_PIN "CHANGE_ME"
+#define SIBOAT_BLE_PIN "042509"
 
 // Optional: require a password for Wi-Fi (OTA) uploads. Leave commented out if your upload tool cannot enter one.
-// #define SIBOAT_OTA_PASSWORD "CHANGE_ME"
+// #define SIBOAT_OTA_PASSWORD "042509"
