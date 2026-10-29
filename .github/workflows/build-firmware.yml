@@ -8,682 +8,236 @@ on:
       - "firmware/**"
       - "siboat_inferencing.zip"
       - ".github/workflows/build-firmware.yml"
-
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: siboat-firmware-build-${{ github.ref }}
+  group: siboat-firmware-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  ARDUINO_CLI_VERSION: "1.5.1"
+  ESP32_CORE_VERSION: "3.3.5"
+  ESP32_INDEX_URL: "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+  REPO_IS_PRIVATE: ${{ github.event.repository.private }}
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
+    name: Compile ${{ matrix.label }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: main
-            name: Main ESP32
-            fqbn: esp32:esp32:esp32
-            source_dir: firmware/main/SIBOAT_MAIN-ESP32_FIRMWARE_FINAL_BOSS
-            sketch: SIBOAT_MAIN-ESP32_FIRMWARE_FINAL_BOSS.ino
-            version_macro: FW_VERSION
-            artifact: SIBOAT_main_ESP32_FIRMWARE
+          - label: "Main ESP32"
+            short: main
+            sketch: SIBOAT_MAIN-ESP32_FIRMWARE_FINAL_BOSS
+            fqbn: "esp32:esp32:esp32"
+            needs_ei: "false"
+          - label: "ESP32-CAM"
+            short: cam
+            sketch: SIBOAT_ESP32-CAM_FIRMWARE_FINAL_BOSS
+            fqbn: "esp32:esp32:esp32cam"
+            needs_ei: "true"
 
-          - id: cam
-            name: ESP32-CAM
-            fqbn: esp32:esp32:esp32cam
-            source_dir: firmware/cam/SIBOAT_ESP32-CAM_FIRMWARE_FINAL_BOSS
-            sketch: SIBOAT_ESP32-CAM_FIRMWARE_FINAL_BOSS.ino
-            version_macro: CAM_FW_VERSION
-            artifact: SIBOAT_ESP32_CAM_FIRMWARE
+    env:
+      SHORT: ${{ matrix.short }}
+      SKETCH: ${{ matrix.sketch }}
+      FQBN_BASE: ${{ matrix.fqbn }}
+      NEEDS_EI: ${{ matrix.needs_ei }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
 
-      - name: Verify repository layout
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "Checking required repository files..."
-
-          test -f "${{ matrix.source_dir }}/${{ matrix.sketch }}"
-          test -f "${{ matrix.source_dir }}/siboat_secrets.example.h"
-
-          if [[ "${{ matrix.id }}" == "main" ]]; then
-            test -f "${{ matrix.source_dir }}/siboat_main_types.h"
-          fi
-
-          if [[ "${{ matrix.id }}" == "cam" ]]; then
-            test -f "siboat_inferencing.zip"
-            test -s "siboat_inferencing.zip"
-          fi
-
-          echo "Repository layout check: PASS"
-
-      - name: Install Arduino CLI
+      - name: Set up Arduino CLI
         uses: arduino/setup-arduino-cli@v2
         with:
-          version: 1.5.1
+          version: ${{ env.ARDUINO_CLI_VERSION }}
 
-      - name: Show Arduino CLI version
+      - name: Install ESP32 Arduino core
         run: |
+          set -euo pipefail
           arduino-cli version
-
-      - name: Configure Arduino CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          arduino-cli config init
-
-          arduino-cli config add board_manager.additional_urls \
-            "https://espressif.github.io/arduino-esp32/package_esp32_index.json"
-
-          arduino-cli core update-index
-
-      - name: Install ESP32 Arduino core 3.3.5
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          arduino-cli core install esp32:esp32@3.3.5
-
-          echo "Installed cores:"
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls "$ESP32_INDEX_URL"
           arduino-cli core list
 
-      - name: Prepare firmware secrets
-        shell: bash
+      - name: Check firmware source files
+        run: |
+          set -euo pipefail
+          DIR="firmware/${SHORT}/${SKETCH}"
+          SRC="${DIR}/${SKETCH}.ino"
+          if [ ! -s "$SRC" ]; then
+            echo "::error::Missing ${SRC}. Folder and file names are case sensitive and must match exactly."
+            find . -name '*.ino' -not -path './.git/*' -print || true
+            exit 1
+          fi
+          test -s "${DIR}/siboat_secrets.example.h" || { echo "::error::Missing ${DIR}/siboat_secrets.example.h"; exit 1; }
+          if [ "$SHORT" = "main" ]; then
+            test -s "${DIR}/siboat_main_types.h" || { echo "::error::Missing ${DIR}/siboat_main_types.h"; exit 1; }
+          fi
+          grep -q 'ArduinoOTA.begin'  "$SRC" || { echo "::error::ArduinoOTA.begin() is missing from ${SRC}. The OTA lines must stay in the firmware."; exit 1; }
+          grep -q 'ArduinoOTA.handle' "$SRC" || { echo "::error::ArduinoOTA.handle() is missing from ${SRC}. The OTA lines must stay in the firmware."; exit 1; }
+          VER="$(grep -E '^#define (CAM_)?FW_VERSION ' "$SRC" | head -1 | sed -E 's/^[^"]*"([^"]*)".*$/\1/')"
+          echo "FW_VERSION=${VER:-unknown}" >> "$GITHUB_ENV"
+          echo "Source OK: $SRC (firmware version ${VER:-unknown})"
+
+      - name: Prepare Wi-Fi and Bluetooth secrets header
         env:
           SIBOAT_SECRETS_H: ${{ secrets.SIBOAT_SECRETS_H }}
         run: |
           set -euo pipefail
-
-          SECRET_FILE="${{ matrix.source_dir }}/siboat_secrets.h"
-
-          if [[ -n "${SIBOAT_SECRETS_H:-}" ]]; then
-            printf '%s\n' "$SIBOAT_SECRETS_H" > "$SECRET_FILE"
-            echo "Using repository secret: SIBOAT_SECRETS_H"
+          DIR="firmware/${SHORT}/${SKETCH}"
+          mkdir -p build
+          if [ -n "${SIBOAT_SECRETS_H:-}" ] && [ "${REPO_IS_PRIVATE}" = "true" ]; then
+            printf '%s\n' "$SIBOAT_SECRETS_H" > "${DIR}/siboat_secrets.h"
+            MODE="REAL credentials from secret SIBOAT_SECRETS_H"
           else
-            cp "${{ matrix.source_dir }}/siboat_secrets.example.h" "$SECRET_FILE"
-            echo "WARNING: SIBOAT_SECRETS_H is not configured."
-            echo "The example secrets file will be used."
-            echo "The firmware may compile, but real Wi-Fi/BLE credentials will not be embedded."
-          fi
-
-          test -s "$SECRET_FILE"
-
-      - name: Validate required secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SECRET_FILE="${{ matrix.source_dir }}/siboat_secrets.h"
-
-          required_defines=(
-            "SIBOAT_SSID1"
-            "SIBOAT_PASS1"
-            "SIBOAT_SSID2"
-            "SIBOAT_PASS2"
-            "SIBOAT_SSID3"
-            "SIBOAT_PASS3"
-            "SIBOAT_BLE_PIN"
-          )
-
-          for symbol in "${required_defines[@]}"; do
-            if ! grep -Eq "^[[:space:]]*#define[[:space:]]+${symbol}([[:space:]]|$)" "$SECRET_FILE"; then
-              echo "ERROR: Required definition is missing: ${symbol}"
-              exit 1
+            cp "${DIR}/siboat_secrets.example.h" "${DIR}/siboat_secrets.h"
+            if [ -n "${SIBOAT_SECRETS_H:-}" ]; then
+              MODE="PLACEHOLDER (repository is public, so the secret was NOT embedded on purpose)"
+            else
+              MODE="PLACEHOLDER (secret SIBOAT_SECRETS_H is not set)"
             fi
-          done
+            echo "::warning::${MODE}. This build compiles, but it will not join your Wi-Fi."
+          fi
+          echo "$MODE" > build/credentials_mode.txt
+          echo "Credentials mode: $MODE"
 
-          echo "Required secret definitions: PASS"
-
-      - name: Validate firmware source
-        shell: bash
+      - name: Install Edge Impulse library (ESP32-CAM only)
+        if: matrix.needs_ei == 'true'
         run: |
           set -euo pipefail
-
-          SOURCE="${{ matrix.source_dir }}/${{ matrix.sketch }}"
-
-          echo "Checking firmware source:"
-          echo "$SOURCE"
-
-          test -s "$SOURCE"
-
-          if [[ "${{ matrix.id }}" == "main" ]]; then
-            grep -q "ArduinoOTA.begin" "$SOURCE"
-            grep -q "ArduinoOTA.handle" "$SOURCE"
-          fi
-
-          if [[ "${{ matrix.id }}" == "cam" ]]; then
-            grep -q "siboat_inferencing.h" "$SOURCE"
-            grep -q "ArduinoOTA.begin" "$SOURCE"
-            grep -q "ArduinoOTA.handle" "$SOURCE"
-          fi
-
-          echo "Firmware source validation: PASS"
-
-      - name: Validate Edge Impulse library
-        if: matrix.id == 'cam'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test -f "siboat_inferencing.zip"
-          test -s "siboat_inferencing.zip"
-
-          mkdir -p "$RUNNER_TEMP/siboat_inferencing"
-
-          unzip -q "siboat_inferencing.zip" \
-            -d "$RUNNER_TEMP/siboat_inferencing"
-
-          echo "Checking extracted Edge Impulse library..."
-
-          find "$RUNNER_TEMP/siboat_inferencing" -maxdepth 4 -type f | sort | head -200
-
-          HEADER_FOUND="$(find "$RUNNER_TEMP/siboat_inferencing" \
-            -type f \
-            -name "siboat_inferencing.h" \
-            | head -n 1)"
-
-          if [[ -z "$HEADER_FOUND" ]]; then
-            echo "ERROR: siboat_inferencing.h was not found inside siboat_inferencing.zip"
+          if [ ! -s siboat_inferencing.zip ]; then
+            echo "::error::siboat_inferencing.zip is missing from the repository root. Upload the Edge Impulse Arduino library ZIP there, with exactly this lowercase name."
             exit 1
           fi
-
-          LIBRARY_PROPERTIES="$(find "$RUNNER_TEMP/siboat_inferencing" \
-            -type f \
-            -name "library.properties" \
-            | head -n 1)"
-
-          if [[ -z "$LIBRARY_PROPERTIES" ]]; then
-            echo "ERROR: library.properties was not found inside siboat_inferencing.zip"
+          EI_TMP="${RUNNER_TEMP}/siboat-ei"
+          EI_LIBS="${RUNNER_TEMP}/siboat-libraries"
+          rm -rf "$EI_TMP" "$EI_LIBS"
+          mkdir -p "$EI_TMP" "$EI_LIBS"
+          unzip -q siboat_inferencing.zip -d "$EI_TMP"
+          PROP="$(find "$EI_TMP" -name library.properties -print -quit)"
+          if [ -z "$PROP" ]; then
+            echo "::error::library.properties was not found inside siboat_inferencing.zip. Export the Arduino library again from Edge Impulse (Deployment > Arduino library)."
             exit 1
           fi
-
-          echo "Edge Impulse header:"
-          echo "$HEADER_FOUND"
-
-          echo "library.properties:"
-          echo "$LIBRARY_PROPERTIES"
-
-          echo "Edge Impulse library validation: PASS"
-
-      - name: Install Edge Impulse Arduino library
-        if: matrix.id == 'cam'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$HOME/Arduino/libraries"
-
-          unzip -q "siboat_inferencing.zip" \
-            -d "$HOME/Arduino/libraries"
-
-          echo "Installed Arduino libraries:"
-          find "$HOME/Arduino/libraries" -maxdepth 2 -type f \
-            -name "library.properties" \
-            -print
-
-      - name: Extract firmware version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SOURCE="${{ matrix.source_dir }}/${{ matrix.sketch }}"
-          MACRO="${{ matrix.version_macro }}"
-
-          VERSION="$(
-            grep -E "^[[:space:]]*#define[[:space:]]+${MACRO}[[:space:]]+" "$SOURCE" \
-            | head -n 1 \
-            | sed -E 's/.*#define[[:space:]]+'"$MACRO"'[[:space:]]+["]?([^"[:space:]]+)["]?.*/\1/'
-          )"
-
-          if [[ -z "$VERSION" ]]; then
-            echo "ERROR: Could not extract firmware version using ${MACRO}"
+          LIB_ROOT="$(dirname "$PROP")"
+          HDR="$(find "$LIB_ROOT" -name siboat_inferencing.h -print -quit)"
+          if [ -z "$HDR" ]; then
+            echo "::error::siboat_inferencing.h was not found inside the ZIP. The header must be named siboat_inferencing.h."
             exit 1
           fi
+          mkdir -p "$EI_LIBS/siboat_inferencing"
+          cp -a "$LIB_ROOT"/. "$EI_LIBS/siboat_inferencing/"
+          echo "EI_LIBS=${EI_LIBS}" >> "$GITHUB_ENV"
+          echo "Edge Impulse library ready: $HDR"
 
-          VERSION="${VERSION//\//-}"
-          VERSION="${VERSION// /-}"
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          echo "Detected firmware version: $VERSION"
-
-      - name: Build firmware
-        id: build
-        shell: bash
+      - name: Compile (OTA-capable partition first, fallback second)
         run: |
-          set -euo pipefail
-
-          SOURCE_DIR="${{ matrix.source_dir }}"
-          SKETCH="${SOURCE_DIR}/${{ matrix.sketch }}"
-
-          BUILD_ROOT="$RUNNER_TEMP/siboat-build-${{ matrix.id }}"
-          BUILD_DIR="$BUILD_ROOT/build"
-
-          mkdir -p "$BUILD_ROOT"
-          mkdir -p "$BUILD_DIR"
-
-          echo "Source directory: $SOURCE_DIR"
-          echo "Sketch: $SKETCH"
-
-          build_ok="false"
-          selected_partition=""
-
-          for partition in min_spiffs huge_app; do
-            echo ""
-            echo "============================================================"
-            echo "Attempting partition scheme: $partition"
-            echo "============================================================"
-
-            rm -rf "$BUILD_DIR"
-            mkdir -p "$BUILD_DIR"
-
-            set +e
-
-            arduino-cli compile \
-              --fqbn "${{ matrix.fqbn }}:PartitionScheme=${partition}" \
-              --build-path "$BUILD_DIR" \
-              --clean \
-              --warnings all \
-              --export-binaries \
-              "$SKETCH"
-
-            status=$?
-
-            set -e
-
-            if [[ "$status" -eq 0 ]]; then
-              echo "Build succeeded with partition scheme: $partition"
-
-              build_ok="true"
-              selected_partition="$partition"
-
+          set -uo pipefail
+          DIR="firmware/${SHORT}/${SKETCH}"
+          LIBFLAG=()
+          if [ "${NEEDS_EI}" = "true" ]; then LIBFLAG=(--libraries "${EI_LIBS}"); fi
+          mkdir -p build
+          USED=""
+          for PART in min_spiffs huge_app; do
+            rm -rf build/bin
+            mkdir -p build/bin
+            echo "=== Compiling ${SKETCH} with PartitionScheme=${PART} ==="
+            if arduino-cli compile \
+                 --fqbn "${FQBN_BASE}:PartitionScheme=${PART}" \
+                 "${LIBFLAG[@]}" \
+                 --export-binaries \
+                 --output-dir build/bin \
+                 "${DIR}" 2>&1 | tee "build/compile_${PART}.log"; then
+              USED="$PART"
               break
             fi
+            echo "::warning::PartitionScheme=${PART} failed (the sketch may not fit). Trying the next scheme."
+          done
+          if [ -z "$USED" ]; then
+            echo "::error::Compilation failed with every partition scheme. The first red error line in the log above is the cause."
+            exit 1
+          fi
+          echo "PART_USED=${USED}" >> "$GITHUB_ENV"
 
-            echo "Build failed with partition scheme: $partition"
+      - name: Package firmware files and build report
+        run: |
+          set -euo pipefail
+          BIN="build/bin"
+          OUT="out/${SKETCH}"
+          mkdir -p "$OUT"
+
+          for f in "${SKETCH}.ino.bin" "${SKETCH}.ino.bootloader.bin" "${SKETCH}.ino.partitions.bin"; do
+            test -s "${BIN}/${f}" || { echo "::error::Expected compiler output ${f} was not produced."; ls -la "$BIN"; exit 1; }
           done
 
-          if [[ "$build_ok" != "true" ]]; then
-            echo "ERROR: Firmware compilation failed for all supported partition schemes."
-            exit 1
+          cp "${BIN}/${SKETCH}.ino.bin"            "${OUT}/${SKETCH}.bin"
+          cp "${BIN}/${SKETCH}.ino.bootloader.bin" "${OUT}/${SKETCH}.bootloader.bin"
+          cp "${BIN}/${SKETCH}.ino.partitions.bin" "${OUT}/${SKETCH}.partitions.bin"
+
+          ALL="none"
+          if [ -s "${BIN}/${SKETCH}.ino.merged.bin" ]; then
+            ALL="${SKETCH}_ALL-IN-ONE_flash_at_0x0.bin"
+            cp "${BIN}/${SKETCH}.ino.merged.bin" "${OUT}/${ALL}"
           fi
 
-          echo "partition=$selected_partition" >> "$GITHUB_OUTPUT"
-          echo "build_dir=$BUILD_DIR" >> "$GITHUB_OUTPUT"
-
-          echo ""
-          echo "Selected partition scheme: $selected_partition"
-
-      - name: Verify generated binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BUILD_DIR="${{ steps.build.outputs.build_dir }}"
-
-          echo "Build directory:"
-          find "$BUILD_DIR" -maxdepth 3 -type f -printf '%p\n' | sort
-
-          APP_BIN="$(find "$BUILD_DIR" -maxdepth 1 -type f -name "*.ino.bin" | head -n 1)"
-
-          if [[ -z "$APP_BIN" ]]; then
-            echo "ERROR: Application .bin was not generated."
-            exit 1
-          fi
-
-          echo "Application binary:"
-          echo "$APP_BIN"
-
-          test -s "$APP_BIN"
-
-          BOOTLOADER_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "bootloader.bin" -o -name "*bootloader*.bin" \) \
-              | head -n 1
-          )"
-
-          PARTITIONS_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "partitions.bin" -o -name "*partitions*.bin" \) \
-              | head -n 1
-          )"
-
-          if [[ -z "$BOOTLOADER_BIN" ]]; then
-            echo "ERROR: bootloader.bin was not generated."
-            exit 1
-          fi
-
-          if [[ -z "$PARTITIONS_BIN" ]]; then
-            echo "ERROR: partitions.bin was not generated."
-            exit 1
-          fi
-
-          test -s "$BOOTLOADER_BIN"
-          test -s "$PARTITIONS_BIN"
-
-          echo "Application binary validation: PASS"
-          echo "Bootloader binary validation: PASS"
-          echo "Partitions binary validation: PASS"
-
-      - name: Prepare release package
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BUILD_DIR="${{ steps.build.outputs.build_dir }}"
-          VERSION="${{ steps.version.outputs.version }}"
-          PARTITION="${{ steps.build.outputs.partition }}"
-
-          PACKAGE_ROOT="$RUNNER_TEMP/package"
-          PACKAGE_DIR="$PACKAGE_ROOT/${{ matrix.artifact }}_${VERSION}"
-
-          rm -rf "$PACKAGE_ROOT"
-          mkdir -p "$PACKAGE_DIR"
-
-          APP_BIN="$(
-            find "$BUILD_DIR" -maxdepth 1 -type f \
-              -name "*.ino.bin" \
-              | head -n 1
-          )"
-
-          BOOTLOADER_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "bootloader.bin" -o -name "*bootloader*.bin" \) \
-              | head -n 1
-          )"
-
-          PARTITIONS_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "partitions.bin" -o -name "*partitions*.bin" \) \
-              | head -n 1
-          )"
-
-          CPUS_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "boot_app0.bin" -o -name "boot_app0*.bin" \) \
-              | head -n 1
-          )"
-
-          cp "$APP_BIN" "$PACKAGE_DIR/firmware.bin"
-          cp "$BOOTLOADER_BIN" "$PACKAGE_DIR/bootloader.bin"
-          cp "$PARTITIONS_BIN" "$PACKAGE_DIR/partitions.bin"
-
-          if [[ -n "$CPUS_BIN" ]]; then
-            cp "$CPUS_BIN" "$PACKAGE_DIR/boot_app0.bin"
-          fi
-
-          if [[ "$PARTITION" == "huge_app" ]]; then
-            OTA_AVAILABLE="NO"
+          if [ "$PART_USED" = "min_spiffs" ]; then
+            OTA="YES - Wi-Fi (OTA) updates work after the first USB flash"
           else
-            OTA_AVAILABLE="YES"
+            OTA="NO - huge_app has no second app slot, so every update must be done over USB"
           fi
-
-          if [[ -f "$PACKAGE_DIR/boot_app0.bin" ]]; then
-            cat > "$PACKAGE_DIR/FLASH_INSTRUCTIONS.txt" <<FLASH_EOF
-SIBOAT FIRMWARE FLASHING INSTRUCTIONS
-=====================================
-
-Board:
-${{ matrix.name }}
-
-Firmware version:
-${VERSION}
-
-Partition scheme:
-${PARTITION}
-
-OTA available:
-${OTA_AVAILABLE}
-
-FIRST USB FLASH
----------------
-
-Use the merged all-in-one binary when available.
-
-Flash address:
-0x0
-
-After flashing, erase/reset the board as appropriate for the board and verify startup.
-
-IMPORTANT:
-The all-in-one binary is intended for initial/full USB flashing.
-
-OTA UPDATE
-----------
-
-OTA should use the normal application firmware.bin only.
-
-Do NOT use the merged all-in-one binary for OTA.
-
-OTA availability:
-${OTA_AVAILABLE}
-
-Files included:
-- firmware.bin
-- bootloader.bin
-- partitions.bin
-- boot_app0.bin
-- SHA256SUMS.txt
-- BUILD_REPORT.txt
-
-IMPORTANT
----------
-
-Do not commit a real siboat_secrets.h file into the repository.
-
-Repository builds should obtain credentials from the GitHub Actions secret:
-
-SIBOAT_SECRETS_H
-
-If the repository secret is not configured, the workflow uses the example secrets header and warns that real credentials are not embedded.
-FLASH_EOF
-          else
-            cat > "$PACKAGE_DIR/FLASH_INSTRUCTIONS.txt" <<FLASH_EOF
-SIBOAT FIRMWARE FLASHING INSTRUCTIONS
-=====================================
-
-Board:
-${{ matrix.name }}
-
-Firmware version:
-${VERSION}
-
-Partition scheme:
-${PARTITION}
-
-OTA available:
-${OTA_AVAILABLE}
-
-FIRST USB FLASH
----------------
-
-Flash the generated application/bootloader/partition binaries using the offsets supplied by the Arduino/ESP32 build output.
-
-Do not use the application firmware.bin as an all-in-one image.
-
-OTA UPDATE
-----------
-
-OTA availability:
-${OTA_AVAILABLE}
-
-If OTA is supported for this partition scheme, use firmware.bin only for OTA.
-
-IMPORTANT
----------
-
-Do not commit a real siboat_secrets.h file into the repository.
-
-Repository builds should obtain credentials from:
-
-SIBOAT_SECRETS_H
-FLASH_EOF
-          fi
-
-          cat > "$PACKAGE_DIR/BUILD_REPORT.txt" <<REPORT_EOF
-SIBOAT FIRMWARE BUILD REPORT
-============================
-
-Board: ${{ matrix.name }}
-FQBN: ${{ matrix.fqbn }}
-Firmware version: ${VERSION}
-Partition scheme: ${PARTITION}
-
-OTA available: ${OTA_AVAILABLE}
-
-Arduino CLI: 1.5.1
-ESP32 Arduino core: 3.3.5
-
-Source:
-${{ matrix.source_dir }}/${{ matrix.sketch }}
-
-Build status:
-SUCCESS
-
-Firmware source was not modified by this workflow.
-REPORT_EOF
-
-          cp "$PACKAGE_DIR/BUILD_REPORT.txt" "$PACKAGE_DIR/../BUILD_REPORT.txt"
-
-          echo "Package prepared:"
-          find "$PACKAGE_DIR" -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Create merged all-in-one image
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BUILD_DIR="${{ steps.build.outputs.build_dir }}"
-          VERSION="${{ steps.version.outputs.version }}"
-          PACKAGE_DIR="$RUNNER_TEMP/package/${{ matrix.artifact }}_${VERSION}"
-
-          BOOTLOADER_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "bootloader.bin" -o -name "*bootloader*.bin" \) \
-              | head -n 1
-          )"
-
-          PARTITIONS_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "partitions.bin" -o -name "*partitions*.bin" \) \
-              | head -n 1
-          )"
-
-          APP_BIN="$(
-            find "$BUILD_DIR" -maxdepth 1 -type f \
-              -name "*.ino.bin" \
-              | head -n 1
-          )"
-
-          BOOT_APP0_BIN="$(
-            find "$BUILD_DIR" -type f \
-              \( -name "boot_app0.bin" -o -name "boot_app0*.bin" \) \
-              | head -n 1
-          )"
-
-          if [[ -z "$BOOT_APP0_BIN" ]]; then
-            echo "boot_app0.bin was not found."
-            echo "Skipping merged all-in-one image."
-            exit 0
-          fi
-
-          MERGED="$PACKAGE_DIR/${{ matrix.artifact }}_${VERSION}_ALL-IN-ONE_flash_at_0x0.bin"
-
-          arduino-cli \
-            --additional-urls "https://espressif.github.io/arduino-esp32/package_esp32_index.json" \
-            compile \
-            --fqbn "${{ matrix.fqbn }}:PartitionScheme=${{ steps.build.outputs.partition }}" \
-            --export-binaries \
-            "${{ matrix.source_dir }}/${{ matrix.sketch }}" \
-            >/dev/null
-
-          ESPTOOL="$(
-            find "$HOME/.arduino15/packages/esp32/tools/esptool_py" \
-              -type f \
-              \( -name "esptool.py" -o -name "esptool" \) \
-              | sort -V \
-              | tail -n 1
-          )"
-
-          if [[ -z "$ESPTOOL" ]]; then
-            echo "ERROR: esptool was not found."
-            exit 1
-          fi
-
-          python3 "$ESPTOOL" \
-            --chip esp32 \
-            merge_bin \
-            -o "$MERGED" \
-            --flash_mode dio \
-            --flash_freq 40m \
-            --flash_size detect \
-            0x1000 "$BOOTLOADER_BIN" \
-            0x8000 "$PARTITIONS_BIN" \
-            0xe000 "$BOOT_APP0_BIN" \
-            0x10000 "$APP_BIN"
-
-          test -s "$MERGED"
-
-          echo "Merged all-in-one image created:"
-          echo "$MERGED"
-
-      - name: Generate checksums
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          VERSION="${{ steps.version.outputs.version }}"
-          PACKAGE_DIR="$RUNNER_TEMP/package/${{ matrix.artifact }}_${VERSION}"
-
-          (
-            cd "$PACKAGE_DIR"
-            sha256sum *.bin > SHA256SUMS.txt
-          )
-
-          echo "SHA256 checksums:"
-          cat "$PACKAGE_DIR/SHA256SUMS.txt"
-
-      - name: Create board flash package ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          VERSION="${{ steps.version.outputs.version }}"
-          PACKAGE_ROOT="$RUNNER_TEMP/package"
-          PACKAGE_DIR="$PACKAGE_ROOT/${{ matrix.artifact }}_${VERSION}"
-
-          cd "$PACKAGE_ROOT"
-
-          zip -qr \
-            "${{ matrix.artifact }}_${VERSION}_FLASH_PACKAGE.zip" \
-            "$(basename "$PACKAGE_DIR")"
-
-          test -s "${{ matrix.artifact }}_${VERSION}_FLASH_PACKAGE.zip"
-
-          echo "Flash package:"
-          ls -lh "${{ matrix.artifact }}_${VERSION}_FLASH_PACKAGE.zip"
-
-      - name: Upload firmware artifact
-        uses: actions/upload-artifact@v5
+          if [ "$SHORT" = "main" ]; then HOST="siboat.local"; else HOST="siboat-cam.local"; fi
+
+          {
+            echo "SIBOAT firmware build report"
+            echo "sketch:            ${SKETCH}"
+            echo "firmware version:  ${FW_VERSION}"
+            echo "board (FQBN):      ${FQBN_BASE}"
+            echo "partition scheme:  ${PART_USED}"
+            echo "OTA available:     ${OTA}"
+            echo "credentials:       $(cat build/credentials_mode.txt)"
+            echo "arduino-cli:       ${ARDUINO_CLI_VERSION}"
+            echo "ESP32 core:        ${ESP32_CORE_VERSION}"
+            echo "git commit:        ${GITHUB_SHA}"
+            echo "built (UTC):       $(date -u '+%Y-%m-%d %H:%M:%S')"
+            grep -hE 'Sketch uses|Global variables' "build/compile_${PART_USED}.log" || true
+            echo
+            echo "FILES"
+            echo "  ${SKETCH}.bin  = the application image (use this for Wi-Fi OTA updates)"
+            if [ "$ALL" = "none" ]; then
+              echo "  (no all-in-one image was produced by this core version)"
+            else
+              echo "  ${ALL}  = complete image for the FIRST flash over USB, written at address 0x0"
+            fi
+            echo "  *.bootloader.bin / *.partitions.bin = parts of the complete image (normally not needed)"
+            echo
+            echo "FLASHING"
+            if [ "$ALL" = "none" ]; then
+              echo "  1) First time over USB: write bootloader at 0x1000, partitions at 0x8000, boot_app0 at 0xE000 (from the ESP32 core), app at 0x10000."
+            else
+              echo "  1) First time over USB: write ${ALL} at address 0x0."
+            fi
+            echo "  2) Later updates over Wi-Fi (only if OTA available = YES): send ${SKETCH}.bin"
+            echo "     to ${HOST} (or the board IP), port 3232."
+            echo "  Always use the files from the same build."
+          } | tee "${OUT}/BUILD_REPORT.txt"
+
+          cat "${OUT}/BUILD_REPORT.txt" >> "$GITHUB_STEP_SUMMARY"
+          ( cd "$OUT" && sha256sum *.bin > SHA256SUMS.txt )
+          ls -la "$OUT"
+
+      - name: Upload firmware files
+        uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact }}_${{ steps.version.outputs.version }}
-          path: |
-            ${{ steps.build.outputs.build_dir }}/*.bin
-            ${{ runner.temp }}/package/${{ matrix.artifact }}_${{ steps.version.outputs.version }}/**
+          name: ${{ matrix.sketch }}
+          path: out/${{ matrix.sketch }}/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
